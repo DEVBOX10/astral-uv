@@ -1,8 +1,9 @@
 use std::cmp::Reverse;
-use std::collections::hash_map::OccupiedEntry;
+use std::hash::BuildHasher;
 
+use hashbrown::hash_map::{RawEntryMut, RawOccupiedEntryMut};
 use pubgrub::Range;
-use rustc_hash::FxHashMap;
+use rustc_hash::FxBuildHasher;
 
 use uv_normalize::PackageName;
 use uv_pep440::Version;
@@ -10,7 +11,7 @@ use uv_pep440::Version;
 use crate::fork_urls::ForkUrls;
 use crate::pubgrub::package::PubGrubPackage;
 use crate::pubgrub::PubGrubPackageInner;
-use crate::SentinelRange;
+use crate::{FxHashbrownMap, SentinelRange};
 
 /// A prioritization map to guide the PubGrub resolution process.
 ///
@@ -23,8 +24,8 @@ use crate::SentinelRange;
 /// See: <https://github.com/pypa/pip/blob/ef78c129b1a966dbbbdb8ebfffc43723e89110d1/src/pip/_internal/resolution/resolvelib/provider.py#L120>
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PubGrubPriorities {
-    package_priority: FxHashMap<PackageName, PubGrubPriority>,
-    virtual_package_tiebreaker: FxHashMap<PubGrubPackage, PubGrubTiebreaker>,
+    package_priority: FxHashbrownMap<PackageName, PubGrubPriority>,
+    virtual_package_tiebreaker: FxHashbrownMap<PubGrubPackage, PubGrubTiebreaker>,
 }
 
 impl PubGrubPriorities {
@@ -35,25 +36,44 @@ impl PubGrubPriorities {
         version: &Range<Version>,
         urls: &ForkUrls,
     ) {
-        if !self.virtual_package_tiebreaker.contains_key(package) {
-            self.virtual_package_tiebreaker.insert(
-                package.clone(),
-                PubGrubTiebreaker::from(
-                    u32::try_from(self.virtual_package_tiebreaker.len())
-                        .expect("Less than 2**32 packages"),
-                ),
-            );
+        // Pre-compute the key and value.
+        let hash = self.virtual_package_tiebreaker.hasher().hash_one(package);
+        let next = self.virtual_package_tiebreaker.len();
+
+        // Insert into the tiebreaker map, if it doesn't exist.
+        match self
+            .virtual_package_tiebreaker
+            .raw_entry_mut()
+            .from_key_hashed_nocheck(hash, package)
+        {
+            RawEntryMut::Vacant(entry) => {
+                entry.insert_hashed_nocheck(
+                    hash,
+                    package.clone(),
+                    PubGrubTiebreaker::from(u32::try_from(next).expect("Less than 2**32 packages")),
+                );
+            }
+            RawEntryMut::Occupied(_) => {
+                // Nothing to do.
+            }
         }
 
-        let next = self.package_priority.len();
         // The root package and Python constraints have no explicit priority, the root package is
         // always first and the Python version (range) is fixed.
         let Some(name) = package.name_no_root() else {
             return;
         };
 
-        match self.package_priority.entry(name.clone()) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
+        // Pre-compute the key and value.
+        let hash = self.package_priority.hasher().hash_one(name);
+        let next = self.package_priority.len();
+
+        match self
+            .package_priority
+            .raw_entry_mut()
+            .from_key_hashed_nocheck(hash, name)
+        {
+            RawEntryMut::Occupied(mut entry) => {
                 // Preserve the original index.
                 let index = Self::get_index(&entry).unwrap_or(next);
 
@@ -81,7 +101,7 @@ impl PubGrubPriorities {
                     entry.insert(priority);
                 }
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            RawEntryMut::Vacant(entry) => {
                 // Compute the priority.
                 let priority = if urls.get(name).is_some() {
                     PubGrubPriority::DirectUrl(Reverse(next))
@@ -94,12 +114,14 @@ impl PubGrubPriorities {
                 };
 
                 // Insert the priority.
-                entry.insert(priority);
+                entry.insert_hashed_nocheck(hash, name.clone(), priority);
             }
         }
     }
 
-    fn get_index(entry: &OccupiedEntry<PackageName, PubGrubPriority>) -> Option<usize> {
+    fn get_index(
+        entry: &RawOccupiedEntryMut<PackageName, PubGrubPriority, FxBuildHasher>,
+    ) -> Option<usize> {
         match entry.get() {
             PubGrubPriority::ConflictLate(Reverse(index))
             | PubGrubPriority::Unspecified(Reverse(index))
@@ -133,7 +155,6 @@ impl PubGrubPriorities {
     /// Returns whether the priority was changed, i.e., it's the first time we hit this condition
     /// for the package.
     pub(crate) fn mark_conflict_early(&mut self, package: &PubGrubPackage) -> bool {
-        let next = self.package_priority.len();
         let Some(name) = package.name_no_root() else {
             // Not a correctness bug
             if cfg!(debug_assertions) {
@@ -142,8 +163,17 @@ impl PubGrubPriorities {
                 return false;
             }
         };
-        match self.package_priority.entry(name.clone()) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
+
+        // Pre-compute the key and value.
+        let hash = self.package_priority.hasher().hash_one(name);
+        let next = self.package_priority.len();
+
+        match self
+            .package_priority
+            .raw_entry_mut()
+            .from_key_hashed_nocheck(hash, name)
+        {
+            RawEntryMut::Occupied(mut entry) => {
                 if matches!(entry.get(), PubGrubPriority::ConflictEarly(_)) {
                     // Already in the right category
                     return false;
@@ -152,8 +182,12 @@ impl PubGrubPriorities {
                 entry.insert(PubGrubPriority::ConflictEarly(Reverse(index)));
                 true
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(PubGrubPriority::ConflictEarly(Reverse(next)));
+            RawEntryMut::Vacant(entry) => {
+                entry.insert_hashed_nocheck(
+                    hash,
+                    name.clone(),
+                    PubGrubPriority::ConflictEarly(Reverse(next)),
+                );
                 true
             }
         }
@@ -165,7 +199,6 @@ impl PubGrubPriorities {
     /// Returns whether the priority was changed, i.e., it's the first time this package was
     /// marked as conflicting above the threshold.
     pub(crate) fn mark_conflict_late(&mut self, package: &PubGrubPackage) -> bool {
-        let next = self.package_priority.len();
         let Some(name) = package.name_no_root() else {
             // Not a correctness bug
             if cfg!(debug_assertions) {
@@ -174,8 +207,25 @@ impl PubGrubPriorities {
                 return false;
             }
         };
-        match self.package_priority.entry(name.clone()) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
+
+        // Pre-compute the key and value.
+        let hash = self.package_priority.hasher().hash_one(name);
+        let next = self.package_priority.len();
+
+        match self
+            .package_priority
+            .raw_entry_mut()
+            .from_key_hashed_nocheck(hash, name)
+        {
+            RawEntryMut::Vacant(entry) => {
+                entry.insert_hashed_nocheck(
+                    hash,
+                    name.clone(),
+                    PubGrubPriority::ConflictLate(Reverse(next)),
+                );
+                true
+            }
+            RawEntryMut::Occupied(mut entry) => {
                 // The ConflictEarly` match avoids infinite loops.
                 if matches!(
                     entry.get(),
@@ -186,10 +236,6 @@ impl PubGrubPriorities {
                 };
                 let index = Self::get_index(&entry).unwrap_or(next);
                 entry.insert(PubGrubPriority::ConflictLate(Reverse(index)));
-                true
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(PubGrubPriority::ConflictLate(Reverse(next)));
                 true
             }
         }
